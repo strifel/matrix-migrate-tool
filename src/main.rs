@@ -1,7 +1,10 @@
 use std::{env, process::exit, collections::HashMap};
 
+use std::fs::File;
+use std::io::Write;
+
 use matrix_sdk::{
-    Client, ruma::{events::room::power_levels::RoomPowerLevels, UserId}, room, config::SyncSettings,
+    config::SyncSettings, room, ruma::{events::room::{history_visibility::{self, HistoryVisibility}, power_levels::RoomPowerLevels}, RoomId, UserId}, Client
 };
 
 async fn login_and_sync(
@@ -34,18 +37,20 @@ async fn process_room(r: &room::Joined, client: &Client, new_user_id: &UserId, l
 
     let power_level = power_levels.for_user(client.user_id().unwrap());
 
+    let is_already_in = r.get_member(new_user_id).await.unwrap().is_some();
 
-
-    if let Err (e) = r.invite_user_by_id(new_user_id).await {
-        println!("Error inviting user: {}", e);
-        if r.is_public() {
-            if r.canonical_alias().is_some() {
-                println!("Room is public: Join via https://matrix.to/#/{}", r.canonical_alias().unwrap().as_str());
-                return String::from("INVITE_ERROR_PUBLIC_ROOM_ALIAS_KNOWN");
+    if !is_already_in {
+        if let Err (e) = r.invite_user_by_id(new_user_id).await {
+            println!("Error inviting user: {}", e);
+            if r.is_public() {
+                if r.canonical_alias().is_some() {
+                    println!("Room is public: Join via https://matrix.to/#/{}", r.canonical_alias().unwrap().as_str());
+                    return String::from("INVITE_ERROR_PUBLIC_ROOM_ALIAS_KNOWN");
+                }
+                return String::from("INVITE_ERROR_PUBLIC_ROOM_ALIAS_UNKNOWN");
             }
-            return String::from("INVITE_ERROR_PUBLIC_ROOM_ALIAS_UNKNOWN");
+            return String::from("INVITE_ERROR");
         }
-        return String::from("INVITE_ERROR");
     }
 
     if power_level.is_positive() {
@@ -90,11 +95,15 @@ async fn main() -> anyhow::Result<()> {
     let mut room_state = HashMap::new();
 
 
-    let joined_rooms = &client.joined_rooms();
+    let mut joined_rooms = client.joined_rooms();
+    joined_rooms.sort_by_key(|j| j.name());
     let mut i = 0;
-    for r in joined_rooms {
+    for r in &joined_rooms {
         let name = r.display_name().await.unwrap();
-        println!("{}: {} ({})", i, name, r.room_id());
+        let encrypted = r.is_encrypted().await.unwrap_or(true);
+        let history_visibility = (r.history_visibility() == HistoryVisibility::Shared || r.history_visibility() == HistoryVisibility::WorldReadable);
+        let is_already_in = r.get_member(new_user_id).await.unwrap().is_some();
+        println!("{}: {} ({}), encrypted: {}, history visible: {}, new account is in room: {}", i, name, r.room_id(), encrypted, history_visibility, is_already_in);
 
         i += 1;
     }
@@ -108,11 +117,38 @@ async fn main() -> anyhow::Result<()> {
     let selection_list = line.split(",");
 
     for rid in selection_list {
-        let selected: usize = rid.replace("!", "").parse().unwrap();
-        let room = &joined_rooms[selected];
-        println!("Processing room {}: {}", rid, room.display_name().await.unwrap());
-        let state = process_room(&room, &client, new_user_id, rid.ends_with("!")).await;
-        room_state.insert(room.room_id(), state);
+        if rid.starts_with("!") {
+            let selected: String = rid.replace("#", "");
+            let room_id = RoomId::parse(selected.to_string());
+            if !room_id.is_ok() || room_id.is_err() {
+                println!("Found broken Room_ID");
+                room_state.insert(selected.to_string(), String::from("ROOMID_INVALID"));
+                continue;
+            }
+            let maybe_room = client.get_joined_room(&room_id.unwrap());
+            if maybe_room.is_none() {
+                room_state.insert(selected.to_string(), String::from("ROOM_NOT_FOUND"));
+                continue;
+            }
+            let room = maybe_room.unwrap();
+            println!("Processing room {}: {}", rid, room.display_name().await.unwrap());
+            let state = process_room(&room, &client, new_user_id, rid.ends_with("#")).await;
+            room_state.insert(selected.to_string(), state);
+        } else {
+            let selected: usize = rid.replace("#", "").parse().unwrap();
+            let room = &joined_rooms[selected];
+            println!("Processing room {}: {}", rid, room.display_name().await.unwrap());
+            let state = process_room(&room, &client, new_user_id, rid.ends_with("#")).await;
+            room_state.insert(room.room_id().as_str().to_string(), state);
+        }
+
+        let mut file = File::create("current_state.json")
+        .expect("Unable to create file");
+
+        file.write_all(json::stringify_pretty(json::object! {
+            "rooms": room_state.clone()
+        }, 4).as_bytes())
+        .expect("Unable to write data");
     }
 
     println!("{}", json::stringify_pretty(json::object! {
